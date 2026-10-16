@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "Mi Presupuesto",
+    "slug": "crown-wallet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.crownwallet.mipresupuesto",
+      "versionCode": 1,
+      "permissions": []
+    }
+  }
+}
