@@ -9,11 +9,11 @@
     "test": "tsc src/core/finance.ts --outDir .test-build --target ES2020 --module commonjs --strict && node --test tests/finance.test.cjs"
   },
   "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~54.0.0",
     "expo-status-bar": "~3.0.0",
     "react": "19.1.0",
-    "react-native": "0.81.4",
-    "@react-native-async-storage/async-storage": "2.2.0"
+    "react-native": "0.81.5"
   },
   "devDependencies": {
     "@types/react": "~19.1.10",

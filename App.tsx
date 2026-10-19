@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { SafeAreaView, ScrollView, StatusBar, Text, TouchableOpacity, View, StyleSheet, TextInput, Alert } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Account, Currency, SavingsGoal, Transfer, createTransactionSnapshot, formatMoney, getAccountBalance, getConsolidatedWealthUsd, getTransactionTotalUsd, initialState, isValidAmount, validateExpense, WalletState } from './src/core/finance';
+import { Account, Currency, SavingsGoal, Transfer, createTransactionSnapshot, formatMoney, getAccountBalance, getConsolidatedWealthUsd, getUsdRate, convertCurrentAmount, getTransactionTotalUsd, initialState, isValidAmount, validateExpense, WalletState } from './src/core/finance';
 
 const STORAGE_KEY = 'crown-wallet-state-v1';
 type Tab = 'Inicio' | 'Categorías' | 'Estadísticas' | 'Movimientos';
@@ -15,7 +15,8 @@ const CATEGORIES: Record<Kind, { id: string; name: string }[]> = {
     { id: 'other-expense', name: 'Otros gastos' },
   ],
   income: [
-    { id: 'salary', name: 'Salario' }, { id: 'business', name: 'Negocio' },
+    { id: 'salary', name: 'Salario' }, { id: 'extra-work', name: 'Trabajo extra' },
+    { id: 'savings', name: 'Ahorros' }, { id: 'business', name: 'Negocio' },
     { id: 'gift', name: 'Regalo' }, { id: 'refund', name: 'Reembolso' },
     { id: 'other-income', name: 'Otros ingresos' },
   ],
@@ -27,12 +28,12 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('Inicio');
   const [loaded, setLoaded] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
-  const [kind, setKind] = useState<Kind>('expense');
+  const [kind, setKind] = useState<Kind>('income');
   const [amountText, setAmountText] = useState('');
   const [note, setNote] = useState('');
   const [accountId, setAccountId] = useState('cash-gyd');
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [categoryId, setCategoryId] = useState('food');
+  const [categoryId, setCategoryId] = useState('salary');
   const [accountManagerOpen, setAccountManagerOpen] = useState(false);
   const [transferManagerOpen, setTransferManagerOpen] = useState(false);
   const [transferFromId, setTransferFromId] = useState('cash-gyd');
@@ -45,11 +46,12 @@ export default function App() {
   const [accountCurrency, setAccountCurrency] = useState<Currency>('GYD');
   const [openingBalanceText, setOpeningBalanceText] = useState('0');
   const [rateText, setRateText] = useState('240');
+  const [gydRateText, setGydRateText] = useState('240');
   const [allowNegativeNew, setAllowNegativeNew] = useState(false);
   const [adjustmentAccountId, setAdjustmentAccountId] = useState('cash-gyd');
   const [adjustmentAmountText, setAdjustmentAmountText] = useState('');
   const [adjustmentNoteText, setAdjustmentNoteText] = useState('');
-  const [budgetPeriod, setBudgetPeriod] = useState<'weekly' | 'monthly'>('monthly');
+  const [budgetPeriod, setBudgetPeriod] = useState<'daily' | 'weekly' | 'monthly'>('monthly');
   const [budgetAmountText, setBudgetAmountText] = useState('');
   const [goalNameText, setGoalNameText] = useState('');
   const [goalTargetText, setGoalTargetText] = useState('');
@@ -63,7 +65,11 @@ export default function App() {
         const saved = await AsyncStorage.getItem(STORAGE_KEY);
         if (saved) {
           const parsed = JSON.parse(saved) as Partial<WalletState>;
-          setState({ ...initialState, ...parsed, accounts: Array.isArray(parsed.accounts) ? parsed.accounts : initialState.accounts, transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [], goals: Array.isArray(parsed.goals) ? parsed.goals : [], adjustments: Array.isArray(parsed.adjustments) ? parsed.adjustments : [], transfers: Array.isArray(parsed.transfers) ? parsed.transfers : [], primaryAccountId: parsed.primaryAccountId ?? initialState.primaryAccountId });
+          const loadedAccounts = (Array.isArray(parsed.accounts) ? parsed.accounts : initialState.accounts).map(a => a.currency === 'GYD' && a.manualUsdRate == null && a.automaticUsdRate == null ? { ...a, manualUsdRate: 240 } : a);
+          const loadedRate = parsed.exchangeRates?.gydPerUsd;
+          const safeRate = typeof loadedRate === 'number' && Number.isFinite(loadedRate) && loadedRate > 0 ? loadedRate : 240;
+          setGydRateText(String(safeRate));
+          setState({ ...initialState, ...parsed, exchangeRates: { gydPerUsd: safeRate }, accounts: loadedAccounts, transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [], goals: Array.isArray(parsed.goals) ? parsed.goals : [], adjustments: Array.isArray(parsed.adjustments) ? parsed.adjustments : [], transfers: Array.isArray(parsed.transfers) ? parsed.transfers : [], primaryAccountId: parsed.primaryAccountId ?? initialState.primaryAccountId });
           if (parsed.budget) { setBudgetPeriod(parsed.budget.period); setBudgetAmountText(String(parsed.budget.amount)); }
         }
       } catch { /* conserva estado inicial si el almacenamiento falla */ }
@@ -79,7 +85,7 @@ export default function App() {
   const wealth = getConsolidatedWealthUsd(state);
   const mainBalance = mainAccount ? getAccountBalance(state, mainAccount.id) ?? 0 : 0;
 
-  const openForm = (nextKind: Kind = 'expense') => {
+  const openForm = (nextKind: Kind = 'income') => {
     setKind(nextKind); setCategoryId(CATEGORIES[nextKind][0].id); setAccountId(mainAccount?.id ?? state.accounts[0]?.id ?? 'cash-gyd'); setAmountText(''); setNote(''); setEditingId(null); setFormOpen(true);
   };
   const saveMovement = () => {
@@ -93,7 +99,10 @@ export default function App() {
     }
     try {
       const existing = editingId ? state.transactions.find(t => t.id === editingId) : undefined;
-      const tx = createTransactionSnapshot({ id: editingId ?? `tx-${Date.now()}`, accountId: selectedAccount.id, kind, amount, currency: selectedAccount.currency, createdAt: existing?.createdAt ?? new Date().toISOString(), categoryId, note: note.trim() || undefined, voided: false }, selectedAccount);
+      const freshTx = createTransactionSnapshot({ id: editingId ?? `tx-${Date.now()}`, accountId: selectedAccount.id, kind, amount, currency: selectedAccount.currency, createdAt: existing?.createdAt ?? new Date().toISOString(), categoryId, note: note.trim() || undefined, voided: false }, selectedAccount, state.exchangeRates);
+      const tx = existing && existing.accountId === selectedAccount.id && existing.currency === selectedAccount.currency
+        ? { ...freshTx, usdRateUsed: existing.usdRateUsed, historicalUsdEquivalent: existing.usdRateUsed !== undefined ? (selectedAccount.currency === 'USD' ? amount : amount / existing.usdRateUsed) : existing.historicalUsdEquivalent }
+        : freshTx;
       setState(s => ({ ...s, transactions: editingId ? s.transactions.map(t => t.id === editingId ? tx : t) : [tx, ...s.transactions] }));
       setFormOpen(false); setTab('Movimientos'); setAmountText(''); setNote(''); setEditingId(null);
       Alert.alert('Guardado', `${editingId ? 'Movimiento actualizado' : kind === 'income' ? 'Ingreso registrado' : 'Gasto registrado'}: ${formatMoney(amount, selectedAccount.currency)}.`);
@@ -117,7 +126,7 @@ export default function App() {
     const transferId = `transfer-${Date.now()}`;
     const feeTransactionId = feeAmount > 0 ? `tx-fee-${transferId}` : undefined;
     const transfer: Transfer = { id: transferId, fromAccountId: from.id, toAccountId: to.id, sentAmount, receivedAmount, fromCurrency: from.currency, toCurrency: to.currency, createdAt: new Date().toISOString(), note: transferNoteText.trim() || undefined, feeTransactionId, voided: false };
-    const feeTransaction = feeAmount > 0 ? createTransactionSnapshot({ id: feeTransactionId!, accountId: from.id, kind: 'expense', amount: feeAmount, currency: from.currency, createdAt: transfer.createdAt, categoryId: 'bank-fees', note: `Comisión por transferencia a ${to.name}`, voided: false }, from) : undefined;
+    const feeTransaction = feeAmount > 0 ? createTransactionSnapshot({ id: feeTransactionId!, accountId: from.id, kind: 'expense', amount: feeAmount, currency: from.currency, createdAt: transfer.createdAt, categoryId: 'bank-fees', note: `Comisión por transferencia a ${to.name}`, voided: false }, from, state.exchangeRates) : undefined;
     setState(s => ({ ...s, transfers: [transfer, ...(s.transfers ?? [])], transactions: feeTransaction ? [feeTransaction, ...s.transactions] : s.transactions }));
     setTransferSentText(''); setTransferReceivedText(''); setTransferNoteText(''); setTransferFeeText('0');
     Alert.alert('Transferencia registrada', `${formatMoney(sentAmount, from.currency)} enviados desde ${from.name}; ${formatMoney(receivedAmount, to.currency)} recibidos en ${to.name}.${feeAmount > 0 ? ` Comisión registrada como gasto separado: ${formatMoney(feeAmount, from.currency)}.` : ''} La transferencia no se cuenta como ingreso ni gasto.`);
@@ -126,13 +135,14 @@ export default function App() {
   const addAccount = () => {
     const name = accountNameText.trim();
     const openingBalance = Number(openingBalanceText.trim());
-    const rate = accountCurrency === 'USD' ? 1 : Number(rateText.trim());
+    const rateTextValue = rateText.trim();
+    const rate = accountCurrency === 'USD' ? 1 : rateTextValue ? Number(rateTextValue) : undefined;
     if (!name) { Alert.alert('Falta el nombre', 'Escribe un nombre para la cuenta.'); return; }
     if (!Number.isFinite(openingBalance)) { Alert.alert('Saldo incorrecto', 'Escribe un saldo inicial válido.'); return; }
-    if (accountCurrency !== 'USD' && (!Number.isFinite(rate) || rate <= 0)) { Alert.alert('Tasa incorrecta', 'La tasa debe ser mayor que cero.'); return; }
+    if (accountCurrency !== 'USD' && rateTextValue && (!Number.isFinite(rate) || (rate ?? 0) <= 0)) { Alert.alert('Tasa incorrecta', 'Si introduces una tasa, debe ser mayor que cero. Déjala vacía si todavía no tienes una tasa válida.'); return; }
     if (!allowNegativeNew && openingBalance < 0) { Alert.alert('Saldo negativo', 'Activa “Permitir saldo negativo” o corrige el saldo inicial.'); return; }
     const id = `account-${Date.now()}`;
-    const account: Account = { id, name, currency: accountCurrency, openingBalance, allowNegative: allowNegativeNew, ...(accountCurrency === 'USD' ? {} : { manualUsdRate: rate }) };
+    const account: Account = { id, name, currency: accountCurrency, openingBalance, allowNegative: allowNegativeNew, ...(accountCurrency === 'USD' ? {} : (rate !== undefined ? { manualUsdRate: rate } : {})) };
     setState(s => ({ ...s, accounts: [...s.accounts, account], primaryAccountId: id }));
     setAccountId(id); setAdjustmentAccountId(id); setAccountNameText(''); setOpeningBalanceText('0'); setRateText('240'); setAccountCurrency('GYD'); setAllowNegativeNew(false);
     Alert.alert('Cuenta creada', `${name} se añadió y ahora es tu cuenta principal.`);
@@ -153,12 +163,19 @@ export default function App() {
     if (account.allowNegative && balance < 0) { Alert.alert('No se puede bloquear', 'Esta cuenta tiene saldo negativo. Primero corrige el saldo.'); return; }
     setState(s => ({ ...s, accounts: s.accounts.map(a => a.id === account.id ? { ...a, allowNegative: !a.allowNegative } : a) }));
   };
+  const saveGydRate = () => {
+    const rate = Number(gydRateText.trim());
+    if (!Number.isFinite(rate) || rate <= 0) { Alert.alert('Tasa incorrecta', 'La tasa debe ser un número mayor que cero.'); return; }
+    setState(s => ({ ...s, exchangeRates: { gydPerUsd: rate } }));
+    Alert.alert('Tasa guardada', `La valoración actual usará 1 USD = ${rate.toLocaleString('en-US', { maximumFractionDigits: 6 })} GYD. Las tasas históricas de los movimientos no cambian.`);
+  };
+
   const saveBudget = () => {
     const amount = Number(budgetAmountText.trim());
     if (!Number.isFinite(amount) || amount <= 0) { Alert.alert('Presupuesto incorrecto', 'Escribe un límite mayor que cero.'); return; }
     const currency = mainAccount?.currency ?? 'GYD';
     setState(s => ({ ...s, budget: { period: budgetPeriod, amount, currency } }));
-    Alert.alert('Presupuesto guardado', `Tu límite ${budgetPeriod === 'weekly' ? 'semanal' : 'mensual'} es ${formatMoney(amount, currency)}.`);
+    Alert.alert('Presupuesto guardado', `Tu límite ${budgetPeriod === 'daily' ? 'diario' : budgetPeriod === 'weekly' ? 'semanal' : 'mensual'} es ${formatMoney(amount, currency)}.`);
   };
 
   const addGoal = () => {
@@ -182,19 +199,21 @@ export default function App() {
 
   const budget = state.budget;
   const now = new Date();
-  const periodStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if ((budget?.period ?? budgetPeriod) === 'weekly') { const day = (periodStart.getDay() + 6) % 7; periodStart.setDate(periodStart.getDate() - day); } else periodStart.setDate(1);
-  const periodEnd = (budget?.period ?? budgetPeriod) === 'weekly' ? new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate() + 7) : new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, 1);
-  const daysLeft = Math.max(1, Math.ceil((periodEnd.getTime() - new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()) / 86400000));
+  const activeBudgetPeriod = budget?.period ?? budgetPeriod;
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const periodStart = new Date(todayStart);
+  if (activeBudgetPeriod === 'weekly') { const day = (periodStart.getDay() + 6) % 7; periodStart.setDate(periodStart.getDate() - day); }
+  else if (activeBudgetPeriod === 'monthly') periodStart.setDate(1);
+  const periodEnd = activeBudgetPeriod === 'daily' ? new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() + 1) : activeBudgetPeriod === 'weekly' ? new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate() + 7) : new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, 1);
+  const daysLeft = Math.max(1, Math.ceil((periodEnd.getTime() - todayStart.getTime()) / 86400000));
   const budgetCurrency = budget?.currency ?? mainAccount?.currency ?? 'GYD';
-  const budgetRateAccount = state.accounts.find(a => a.currency === budgetCurrency);
-  const budgetUsdRate = budgetCurrency === 'USD' ? 1 : budgetRateAccount ? (budgetRateAccount.manualUsdRate ?? budgetRateAccount.automaticUsdRate ?? null) : null;
   const periodExpenses = state.transactions.filter(t => !t.voided && t.kind === 'expense' && new Date(t.createdAt) >= periodStart && new Date(t.createdAt) < periodEnd);
   let spentInBudget = 0; let budgetHasPending = false;
   for (const t of periodExpenses) {
     const a = state.accounts.find(x => x.id === t.accountId);
-    const usd = t.historicalUsdEquivalent ?? (a && (t.usdRateUsed ?? (a.currency === 'USD' ? 1 : a.manualUsdRate ?? a.automaticUsdRate)) ? t.amount / (a!.currency === 'USD' ? 1 : (t.usdRateUsed ?? a!.manualUsdRate ?? a!.automaticUsdRate)!) : undefined);
-    if (usd === undefined || budgetUsdRate === null || budgetUsdRate <= 0) budgetHasPending = true; else spentInBudget += usd * budgetUsdRate;
+    if (!a) { budgetHasPending = true; continue; }
+    const converted = convertCurrentAmount(state, t.amount, a.currency, budgetCurrency);
+    if (converted === null || !Number.isFinite(converted)) budgetHasPending = true; else spentInBudget += converted;
   }
   const budgetRemaining = budget ? budget.amount - spentInBudget : 0;
   const dailyAvailable = budget ? budgetRemaining / daysLeft : 0;
@@ -225,7 +244,7 @@ export default function App() {
         <Text style={styles.label}>Nombre</Text><TextInput value={accountNameText} onChangeText={setAccountNameText} placeholder="Ej. Ahorros" placeholderTextColor="#738097" style={styles.input} maxLength={40} />
         <Text style={styles.label}>Moneda</Text><View style={styles.choiceRow}>{(['GYD','USD','EUR','GBP','CAD','PYG','UYU','BRL','CRC'] as Currency[]).map(c => <TouchableOpacity key={c} style={[styles.choice, accountCurrency === c && styles.choiceActive]} onPress={() => { setAccountCurrency(c); setRateText(c === 'USD' ? '1' : c === 'GYD' ? '240' : '') }}><Text style={styles.buttonText}>{c}</Text></TouchableOpacity>)}</View>
         <Text style={styles.label}>Saldo inicial ({accountCurrency})</Text><TextInput value={openingBalanceText} onChangeText={setOpeningBalanceText} keyboardType="decimal-pad" placeholder="0" placeholderTextColor="#738097" style={styles.input} />
-        {accountCurrency !== 'USD' ? <><Text style={styles.label}>Tasa manual (1 USD = cuántos {accountCurrency})</Text><TextInput value={rateText} onChangeText={setRateText} keyboardType="decimal-pad" placeholder="Escribe la tasa" placeholderTextColor="#738097" style={styles.input} /></> : <Text style={styles.subtle}>La tasa del USD es 1.</Text>}
+        {accountCurrency !== 'USD' ? <><Text style={styles.label}>Tasa de referencia (1 USD = cuántos {accountCurrency})</Text><TextInput value={rateText} onChangeText={setRateText} keyboardType="decimal-pad" placeholder={accountCurrency === 'GYD' ? '240' : 'Escribe la tasa'} placeholderTextColor="#738097" style={styles.input} /></> : <Text style={styles.subtle}>La tasa del USD es 1.</Text>}
         <TouchableOpacity style={styles.choice} onPress={() => setAllowNegativeNew(v => !v)}><Text style={styles.buttonText}>{allowNegativeNew ? '✓ Permitir saldo negativo' : '□ Bloquear saldo negativo'}</Text></TouchableOpacity>
         <TouchableOpacity style={styles.primaryButton} onPress={addAccount}><Text style={styles.primaryButtonText}>＋ Crear cuenta</Text></TouchableOpacity>
         <Text style={styles.cardTitle}>Ajustar saldo sin registrar ingreso/gasto</Text>
@@ -237,8 +256,8 @@ export default function App() {
       </View> : formOpen ? <View style={styles.card}>
         <Text style={styles.cardTitle}>{editingId ? 'Editar movimiento' : 'Registrar movimiento'}</Text>
         <View style={styles.row}>
-          <TouchableOpacity style={[styles.kindButton, kind === 'expense' && styles.kindExpense]} onPress={() => { setKind('expense'); setCategoryId(CATEGORIES.expense[0].id); }}><Text style={styles.buttonText}>Gasto</Text></TouchableOpacity>
           <TouchableOpacity style={[styles.kindButton, kind === 'income' && styles.kindIncome]} onPress={() => { setKind('income'); setCategoryId(CATEGORIES.income[0].id); }}><Text style={styles.buttonText}>Ingreso</Text></TouchableOpacity>
+          <TouchableOpacity style={[styles.kindButton, kind === 'expense' && styles.kindExpense]} onPress={() => { setKind('expense'); setCategoryId(CATEGORIES.expense[0].id); }}><Text style={styles.buttonText}>Gasto</Text></TouchableOpacity>
         </View>
         <Text style={styles.label}>Cuenta</Text>
         <View style={styles.choiceRow}>{state.accounts.map(a => <TouchableOpacity key={a.id} style={[styles.choice, accountId === a.id && styles.choiceActive]} onPress={() => setAccountId(a.id)}><Text style={styles.buttonText}>{a.name} ({a.currency})</Text></TouchableOpacity>)}</View>
@@ -255,14 +274,15 @@ export default function App() {
         <View style={styles.hero}>
           <Text style={styles.eyebrow}>SALDO DE {mainAccount?.name.toUpperCase() ?? 'CUENTA'}</Text>
           <Text style={styles.balance}>{formatMoney(mainBalance, mainAccount?.currency ?? 'GYD')}</Text>
-          <Text style={styles.subtle}>Equivalente en USD: {mainAccount && (mainAccount.currency === 'USD' || mainAccount.manualUsdRate || mainAccount.automaticUsdRate) ? formatMoney(mainAccount.currency === 'USD' ? mainBalance : mainBalance / (mainAccount.manualUsdRate ?? mainAccount.automaticUsdRate ?? 1), 'USD') : 'Pendiente de tasa'}</Text>
+          <Text style={styles.subtle}>Equivalente en USD: {mainAccount && getUsdRate(mainAccount, state.exchangeRates) !== null ? formatMoney(mainAccount.currency === 'USD' ? mainBalance : mainBalance / (getUsdRate(mainAccount, state.exchangeRates) ?? 1), 'USD') : 'Pendiente de tasa'}</Text>
           <Text style={styles.subtle}>Patrimonio en USD: {formatMoney(wealth.value, 'USD')}{wealth.pendingAccounts.length ? ` · Incompleto: falta tasa en ${wealth.pendingAccounts.join(', ')}` : ''}</Text>
-          <View style={styles.rule} /><Text style={styles.eyebrow}>TASA DE REFERENCIA DE ESTA CUENTA</Text>
-          <Text style={styles.rate}>{mainAccount?.currency === 'USD' ? '1 USD = 1 USD' : `1 USD = ${(mainAccount?.manualUsdRate ?? mainAccount?.automaticUsdRate ?? 0).toLocaleString('en-US', { maximumFractionDigits: 6 })} ${mainAccount?.currency ?? 'GYD'}`}</Text>
-          <Text style={styles.note}>La actualización de tasas de mercado todavía está pendiente.</Text>
+          <View style={styles.rule} /><Text style={styles.eyebrow}>TASA DE REFERENCIA APLICADA A ESTA CUENTA</Text>
+          <Text style={styles.rate}>{mainAccount?.currency === 'USD' ? '1 USD = 1 USD' : mainAccount?.currency === 'GYD' ? `1 USD = ${(state.exchangeRates?.gydPerUsd ?? 240).toLocaleString('en-US', { maximumFractionDigits: 6 })} GYD` : getUsdRate(mainAccount, state.exchangeRates) ? `1 USD = ${getUsdRate(mainAccount, state.exchangeRates)!.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${mainAccount?.currency ?? ''}` : 'Tasa pendiente · configura una tasa válida'}</Text>
+          <Text style={styles.note}>La tasa GYD es global y se aplica a la valoración actual de todas las cuentas GYD y al presupuesto. Los movimientos conservan la tasa histórica con la que se registraron.</Text>
         </View>
+        <View style={styles.card}><Text style={styles.cardTitle}>Tasa global de referencia GYD/USD</Text><Text style={styles.subtle}>Valor inicial: 240 GYD por 1 USD. Cambiar esta tasa actualiza la valoración del patrimonio y del presupuesto, pero no modifica movimientos anteriores.</Text><Text style={styles.label}>1 USD equivale a cuántos GYD</Text><TextInput value={gydRateText} onChangeText={setGydRateText} keyboardType="decimal-pad" placeholder="240" placeholderTextColor="#738097" style={styles.input}/><TouchableOpacity style={styles.primaryButton} onPress={saveGydRate}><Text style={styles.primaryButtonText}>Guardar tasa global</Text></TouchableOpacity></View>
         <View style={styles.row}><View style={styles.statCard}><Text style={styles.eyebrow}>INGRESOS</Text><Text style={styles.income}>{formatMoney(totalIncome.value, 'USD')}</Text><Text style={styles.subtle}>{totalIncome.pendingAccounts.length ? 'Equivalente pendiente' : 'Total histórico equivalente'}</Text></View><View style={styles.statCard}><Text style={styles.eyebrow}>GASTOS</Text><Text style={styles.expense}>{formatMoney(totalExpense.value, 'USD')}</Text><Text style={styles.subtle}>{totalExpense.pendingAccounts.length ? 'Equivalente pendiente' : 'Total histórico equivalente'}</Text></View></View>
-        <View style={styles.card}><Text style={styles.cardTitle}>Presupuesto y disponible por día</Text><Text style={styles.subtle}>Elige el período según cómo cobras. La semana empieza el lunes. Solo se descuentan los gastos registrados; los ingresos no aumentan automáticamente el límite.</Text><Text style={styles.label}>¿Cómo recibes tu dinero?</Text><View style={styles.choiceRow}><TouchableOpacity style={[styles.choice, budgetPeriod === 'weekly' && styles.choiceActive]} onPress={() => setBudgetPeriod('weekly')}><Text style={styles.buttonText}>Semanal</Text></TouchableOpacity><TouchableOpacity style={[styles.choice, budgetPeriod === 'monthly' && styles.choiceActive]} onPress={() => setBudgetPeriod('monthly')}><Text style={styles.buttonText}>Mensual</Text></TouchableOpacity></View><Text style={styles.label}>Límite para el período ({mainAccount?.currency ?? 'GYD'})</Text><TextInput value={budgetAmountText} onChangeText={setBudgetAmountText} keyboardType="decimal-pad" placeholder="Ej. 25000" placeholderTextColor="#738097" style={styles.input}/><TouchableOpacity style={styles.primaryButton} onPress={saveBudget}><Text style={styles.primaryButtonText}>Guardar presupuesto</Text></TouchableOpacity>{budget ? <><View style={styles.rule}/><Text style={styles.eyebrow}>{budget.period === 'weekly' ? 'PRESUPUESTO SEMANAL' : 'PRESUPUESTO MENSUAL'}</Text><Text style={styles.balance}>{formatMoney(budget.amount, budget.currency)}</Text><View style={styles.accountLine}><Text style={styles.accountName}>Gastado en este período</Text><Text style={styles.expense}>{formatMoney(spentInBudget, budget.currency)}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Restante</Text><Text style={budgetRemaining < 0 ? styles.expense : styles.income}>{formatMoney(budgetRemaining, budget.currency)}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Disponible por día</Text><Text style={dailyAvailable < 0 ? styles.expense : styles.amount}>{formatMoney(dailyAvailable, budget.currency)}</Text></View>{budgetHasPending ? <Text style={styles.note}>Aviso: algunos gastos no tienen una tasa disponible y no se pudieron convertir al presupuesto. El total puede ser parcial.</Text> : null}{budgetRemaining < 0 ? <Text style={styles.note}>Has superado tu límite. Puedes seguir registrando gastos; este aviso no bloquea la aplicación.</Text> : <Text style={styles.note}>Quedan {daysLeft} día(s) contando hoy, según el período elegido.</Text>}</> : <Text style={styles.note}>Todavía no has guardado un presupuesto. Recomendado: elige semanal si cobras cada semana o mensual si cobras una vez al mes.</Text>}</View>
+        <View style={styles.card}><Text style={styles.cardTitle}>Presupuesto y disponible por día</Text><Text style={styles.subtle}>Elige un límite diario, semanal o mensual. La semana empieza el lunes. Solo se descuentan los gastos registrados; los ingresos no aumentan automáticamente el límite.</Text><Text style={styles.label}>¿Cómo recibes tu dinero?</Text><View style={styles.choiceRow}><TouchableOpacity style={[styles.choice, budgetPeriod === 'daily' && styles.choiceActive]} onPress={() => setBudgetPeriod('daily')}><Text style={styles.buttonText}>Diario</Text></TouchableOpacity><TouchableOpacity style={[styles.choice, budgetPeriod === 'weekly' && styles.choiceActive]} onPress={() => setBudgetPeriod('weekly')}><Text style={styles.buttonText}>Semanal</Text></TouchableOpacity><TouchableOpacity style={[styles.choice, budgetPeriod === 'monthly' && styles.choiceActive]} onPress={() => setBudgetPeriod('monthly')}><Text style={styles.buttonText}>Mensual</Text></TouchableOpacity></View><Text style={styles.label}>Límite para el período ({mainAccount?.currency ?? 'GYD'})</Text><TextInput value={budgetAmountText} onChangeText={setBudgetAmountText} keyboardType="decimal-pad" placeholder="Ej. 25000" placeholderTextColor="#738097" style={styles.input}/><TouchableOpacity style={styles.primaryButton} onPress={saveBudget}><Text style={styles.primaryButtonText}>Guardar presupuesto</Text></TouchableOpacity>{budget ? <><View style={styles.rule}/><Text style={styles.eyebrow}>{budget.period === 'daily' ? 'PRESUPUESTO DIARIO' : budget.period === 'weekly' ? 'PRESUPUESTO SEMANAL' : 'PRESUPUESTO MENSUAL'}</Text><Text style={styles.balance}>{formatMoney(budget.amount, budget.currency)}</Text><View style={styles.accountLine}><Text style={styles.accountName}>Gastado en este período</Text><Text style={styles.expense}>{formatMoney(spentInBudget, budget.currency)}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Restante</Text><Text style={budgetRemaining < 0 ? styles.expense : styles.income}>{formatMoney(budgetRemaining, budget.currency)}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Disponible por día</Text><Text style={dailyAvailable < 0 ? styles.expense : styles.amount}>{formatMoney(dailyAvailable, budget.currency)}</Text></View>{budgetHasPending ? <Text style={styles.note}>Aviso: algunos gastos no tienen una tasa disponible y no se pudieron convertir al presupuesto. El total puede ser parcial.</Text> : null}{budgetRemaining < 0 ? <Text style={styles.note}>Has superado tu límite. Puedes seguir registrando gastos; este aviso no bloquea la aplicación.</Text> : <Text style={styles.note}>Quedan {daysLeft} día(s) contando hoy, según el período elegido.</Text>}</> : <Text style={styles.note}>Todavía no has guardado un presupuesto. Recomendado: elige semanal si cobras cada semana o mensual si cobras una vez al mes.</Text>}</View>
         <View style={styles.card}><Text style={styles.cardTitle}>Mis cuentas</Text><TouchableOpacity style={styles.primaryButton} onPress={() => { setTransferManagerOpen(true); setAccountManagerOpen(false); setTransferFromId(mainAccount?.id ?? state.accounts[0]?.id ?? 'cash-gyd'); setTransferToId(state.accounts.find(a => a.id !== mainAccount?.id)?.id ?? state.accounts[1]?.id ?? 'bank-gyd'); }}><Text style={styles.primaryButtonText}>⇄ Transferir entre cuentas</Text></TouchableOpacity><TouchableOpacity style={styles.primaryButton} onPress={() => { setAccountManagerOpen(true); setFormOpen(false); setAdjustmentAccountId(mainAccount?.id ?? state.accounts[0]?.id ?? 'cash-gyd'); }}><Text style={styles.primaryButtonText}>Administrar / crear cuentas</Text></TouchableOpacity>{state.accounts.map(a => <TouchableOpacity key={a.id} style={styles.accountLine} onPress={() => setState(s => ({ ...s, primaryAccountId: a.id }))}><View><Text style={styles.accountName}>{a.name}{a.id === state.primaryAccountId ? '  ✓' : ''}</Text><Text style={styles.subtle}>{a.currency} · {a.allowNegative ? 'Negativo permitido' : 'Negativo bloqueado'} · Toca para seleccionar</Text></View><Text style={styles.amount}>{formatMoney(getAccountBalance(state, a.id) ?? 0, a.currency)}</Text></TouchableOpacity>)}</View>
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Metas de ahorro</Text>
@@ -278,9 +298,9 @@ export default function App() {
             {g.savedAmount < g.targetAmount ? <><TextInput value={goalContributionText[g.id] ?? ''} onChangeText={v => setGoalContributionText(s => ({...s,[g.id]:v}))} keyboardType="decimal-pad" placeholder={`Aportación en ${g.currency}`} placeholderTextColor="#738097" style={styles.input}/><TouchableOpacity style={styles.choice} onPress={() => addGoalContribution(g)}><Text style={styles.buttonText}>Registrar aportación</Text></TouchableOpacity></> : <Text style={styles.income}>¡Meta completada!</Text>}
           </View>; })}
         </View>
-      </> : tab === 'Movimientos' ? <View style={styles.card}><Text style={styles.cardTitle}>Movimientos</Text><TouchableOpacity style={styles.primaryButton} onPress={() => openForm('expense')}><Text style={styles.primaryButtonText}>＋ Registrar ingreso o gasto</Text></TouchableOpacity>{state.transactions.filter(t => !t.voided).length === 0 ? <Text style={styles.subtle}>Todavía no hay movimientos registrados.</Text> : state.transactions.filter(t => !t.voided).map(t => { const a = state.accounts.find(x => x.id === t.accountId); return <View key={t.id} style={styles.accountLine}><TouchableOpacity style={{ flex: 1 }} onPress={() => { setEditingId(t.id); setKind(t.kind); setCategoryId(t.categoryId && CATEGORIES[t.kind].some(c => c.id === t.categoryId) ? t.categoryId : CATEGORIES[t.kind][0].id); setAccountId(t.accountId); setAmountText(String(t.amount)); setNote(t.note ?? ''); setFormOpen(true); }}><Text style={styles.accountName}>{categoryName(t.categoryId)}{t.note ? ` · ${t.note}` : ''}</Text><Text style={styles.subtle}>{a?.name ?? 'Cuenta'} · {new Date(t.createdAt).toLocaleDateString('es')} · Toca para editar</Text></TouchableOpacity><View style={{ alignItems: 'flex-end', gap: 6 }}><Text style={t.kind === 'income' ? styles.income : styles.expense}>{t.kind === 'income' ? '+' : '−'}{formatMoney(t.amount, t.currency)}</Text><TouchableOpacity onPress={() => Alert.alert('Anular movimiento', 'Se excluirá del saldo y las estadísticas, pero se conservará en el historial.', [{ text: 'Cancelar', style: 'cancel' }, { text: 'Anular', style: 'destructive', onPress: () => setState(s => ({ ...s, transactions: s.transactions.map(x => x.id === t.id ? { ...x, voided: true } : x) })) }])}><Text style={{ color: '#ff737b', fontSize: 12, fontWeight: '700' }}>Anular</Text></TouchableOpacity></View></View>; })}</View> : tab === 'Categorías' ? <View style={styles.card}><Text style={styles.cardTitle}>Categorías de gastos</Text><Text style={styles.subtle}>Importes en USD según la tasa guardada al registrar cada movimiento. Las categorías sin movimientos muestran cero.</Text>{CATEGORIES.expense.map(c => { const txs = state.transactions.filter(t => !t.voided && t.kind === 'expense' && t.categoryId === c.id); const total = txs.reduce((sum, t) => sum + (t.historicalUsdEquivalent ?? 0), 0); const pending = txs.some(t => t.historicalUsdEquivalent === undefined); return <View key={c.id} style={styles.accountLine}><View style={{flex:1}}><Text style={styles.accountName}>{c.name}</Text><Text style={styles.subtle}>{txs.length} movimiento{txs.length === 1 ? '' : 's'}{pending ? ' · hay equivalentes pendientes' : ''}</Text></View><Text style={styles.amount}>{pending ? 'Parcial · ' : ''}{formatMoney(total, 'USD')}</Text></View>; })}<Text style={styles.note}>Por ahora son categorías iniciales; la creación y edición de categorías personalizadas se añadirá después.</Text></View> : tab === 'Estadísticas' ? <View style={styles.card}><Text style={styles.cardTitle}>Resumen de movimientos</Text><View style={styles.accountLine}><Text style={styles.accountName}>Ingresos registrados</Text><Text style={styles.income}>{formatMoney(totalIncome.value, 'USD')}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Gastos registrados</Text><Text style={styles.expense}>{formatMoney(totalExpense.value, 'USD')}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Balance neto histórico</Text><Text style={styles.amount}>{formatMoney(totalIncome.value - totalExpense.value, 'USD')}</Text></View><Text style={styles.subtle}>Los totales usan equivalentes históricos disponibles. {totalIncome.pendingAccounts.length || totalExpense.pendingAccounts.length ? 'Algunos movimientos no tienen tasa y no están incluidos en el total equivalente.' : 'No hay equivalentes pendientes.'}</Text></View> : <View style={styles.card}><Text style={styles.cardTitle}>{tab}</Text><Text style={styles.subtle}>Esta sección sigue en desarrollo; no se muestran datos inventados.</Text></View>}
+      </> : tab === 'Movimientos' ? <View style={styles.card}><Text style={styles.cardTitle}>Movimientos</Text><TouchableOpacity style={styles.primaryButton} onPress={() => openForm('income')}><Text style={styles.primaryButtonText}>＋ Registrar ingreso o gasto</Text></TouchableOpacity>{state.transactions.filter(t => !t.voided).length === 0 ? <Text style={styles.subtle}>Todavía no hay movimientos registrados.</Text> : state.transactions.filter(t => !t.voided).map(t => { const a = state.accounts.find(x => x.id === t.accountId); return <View key={t.id} style={styles.accountLine}><TouchableOpacity style={{ flex: 1 }} onPress={() => { setEditingId(t.id); setKind(t.kind); setCategoryId(t.categoryId && CATEGORIES[t.kind].some(c => c.id === t.categoryId) ? t.categoryId : CATEGORIES[t.kind][0].id); setAccountId(t.accountId); setAmountText(String(t.amount)); setNote(t.note ?? ''); setFormOpen(true); }}><Text style={styles.accountName}>{categoryName(t.categoryId)}{t.note ? ` · ${t.note}` : ''}</Text><Text style={styles.subtle}>{a?.name ?? 'Cuenta'} · {new Date(t.createdAt).toLocaleDateString('es')} · Toca para editar</Text></TouchableOpacity><View style={{ alignItems: 'flex-end', gap: 6 }}><Text style={t.kind === 'income' ? styles.income : styles.expense}>{t.kind === 'income' ? '+' : '−'}{formatMoney(t.amount, t.currency)}</Text><TouchableOpacity onPress={() => Alert.alert('Anular movimiento', 'Se excluirá del saldo y las estadísticas, pero se conservará en el historial.', [{ text: 'Cancelar', style: 'cancel' }, { text: 'Anular', style: 'destructive', onPress: () => setState(s => ({ ...s, transactions: s.transactions.map(x => x.id === t.id ? { ...x, voided: true } : x) })) }])}><Text style={{ color: '#ff737b', fontSize: 12, fontWeight: '700' }}>Anular</Text></TouchableOpacity></View></View>; })}</View> : tab === 'Categorías' ? <View style={styles.card}><Text style={styles.cardTitle}>Categorías de gastos</Text><Text style={styles.subtle}>Importes en USD según la tasa guardada al registrar cada movimiento. Las categorías sin movimientos muestran cero.</Text>{CATEGORIES.expense.map(c => { const txs = state.transactions.filter(t => !t.voided && t.kind === 'expense' && t.categoryId === c.id); const total = txs.reduce((sum, t) => sum + (t.historicalUsdEquivalent ?? 0), 0); const pending = txs.some(t => t.historicalUsdEquivalent === undefined); return <View key={c.id} style={styles.accountLine}><View style={{flex:1}}><Text style={styles.accountName}>{c.name}</Text><Text style={styles.subtle}>{txs.length} movimiento{txs.length === 1 ? '' : 's'}{pending ? ' · hay equivalentes pendientes' : ''}</Text></View><Text style={styles.amount}>{pending ? 'Parcial · ' : ''}{formatMoney(total, 'USD')}</Text></View>; })}<Text style={styles.note}>Por ahora son categorías iniciales; la creación y edición de categorías personalizadas se añadirá después.</Text></View> : tab === 'Estadísticas' ? <View style={styles.card}><Text style={styles.cardTitle}>Resumen de movimientos</Text><View style={styles.accountLine}><Text style={styles.accountName}>Ingresos registrados</Text><Text style={styles.income}>{formatMoney(totalIncome.value, 'USD')}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Gastos registrados</Text><Text style={styles.expense}>{formatMoney(totalExpense.value, 'USD')}</Text></View><View style={styles.accountLine}><Text style={styles.accountName}>Balance neto histórico</Text><Text style={styles.amount}>{formatMoney(totalIncome.value - totalExpense.value, 'USD')}</Text></View><Text style={styles.subtle}>Los totales usan equivalentes históricos disponibles. {totalIncome.pendingAccounts.length || totalExpense.pendingAccounts.length ? 'Algunos movimientos no tienen tasa y no están incluidos en el total equivalente.' : 'No hay equivalentes pendientes.'}</Text></View> : <View style={styles.card}><Text style={styles.cardTitle}>{tab}</Text><Text style={styles.subtle}>Esta sección sigue en desarrollo; no se muestran datos inventados.</Text></View>}
     </ScrollView>
-    <View style={styles.nav}>{(['Inicio', 'Categorías', '＋', 'Estadísticas', 'Movimientos'] as const).map(item => <TouchableOpacity key={item} style={styles.navItem} onPress={() => { if (item === '＋') openForm('expense'); else { setFormOpen(false); setAccountManagerOpen(false); setTransferManagerOpen(false); setTab(item); } }}><Text style={[styles.navText, (item === tab || (item === '＋' && formOpen)) && styles.navActive]}>{item}</Text></TouchableOpacity>)}</View>
+    <View style={styles.nav}>{(['Inicio', 'Categorías', '＋', 'Estadísticas', 'Movimientos'] as const).map(item => <TouchableOpacity key={item} style={styles.navItem} onPress={() => { if (item === '＋') openForm('income'); else { setFormOpen(false); setAccountManagerOpen(false); setTransferManagerOpen(false); setTab(item); } }}><Text style={[styles.navText, (item === tab || (item === '＋' && formOpen)) && styles.navActive]}>{item}</Text></TouchableOpacity>)}</View>
   </SafeAreaView>;
 }
 

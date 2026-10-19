@@ -1,0 +1,38 @@
+name: Crown Wallet Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+jobs:
+  build:
+    name: Build and publish Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Run financial tests
+        run: npm test
+      - name: Check project TypeScript
+        run: npm run typecheck
+      - name: Check EAS CLI
+        run: npx eas-cli --version
+      - name: Build installable APK on EAS
+        run: npx eas-cli build --platform android --profile preview --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      - name: Download generated APK
+        run: |
+          mkdir -p dist
+          npx eas-cli build:download --latest --platform android --output ./dist/CrownWallet.apk
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CrownWallet-Android-APK
+          path: dist/CrownWallet.apk
+          if-no-files-found: error
